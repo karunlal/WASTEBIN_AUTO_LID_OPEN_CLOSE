@@ -1,0 +1,175 @@
+// Auto Waste Bin - UNO (HC-SR04 + Servo + LED) - Hysteresis + Debug
+// Pins: TRIG=D12, ECHO=D11, SERVO=D9, LED=D8
+// Serial: 115200
+
+#include <Servo.h>
+
+const int TRIG_PIN = 12;
+const int ECHO_PIN = 11;
+const int LED_PIN  = 8;
+const int SERVO_PIN = 9;
+
+const int THRESH_CM = 23;             // threshold to open lid (cm)
+const unsigned long OPEN_MS = 2500UL; // base open time (ms)
+const int MEDIAN_SAMPLES = 5;         // must be odd
+const unsigned long DIST_PRINT_INTERVAL = 600UL; // ms between distance prints
+
+// Hysteresis / debounce
+const int DETECT_REQUIRED = 3; // consecutive valid detections to open
+const int MISS_REQUIRED   = 3; // consecutive misses to consider "gone" and eventually close
+
+// Servo tuning (change if needed)
+// --- SWAPPED to reverse rotation direction ---
+const int SERVO_CLOSED_ANGLE = 160;   // previously open; now closed (degrees)
+const int SERVO_OPEN_ANGLE   = 0;     // previously closed; now open
+const int MAX_SERVO_ANGLE    = 180;   // hard clamp
+const int SERVO_STEP_DELAY_MS = 6;    // smooth movement step delay (ms)
+
+Servo lidServo;
+
+bool isOpen = false;
+unsigned long openUntil = 0;
+unsigned long lastPrint = 0;
+unsigned long lastOpenTime = 0;
+int currentServoAngle = SERVO_CLOSED_ANGLE;
+
+int detectCounter = 0;
+int missCounter = 0;
+
+// Single ultrasonic measure (cm). Returns -1 on timeout/no echo.
+long measureOnce() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000UL); // 30 ms timeout
+  if (duration == 0) return -1; // timeout, no echo
+  long cm = duration / 58; // approximate
+  return cm;
+}
+
+// Return median of MEDIAN_SAMPLES measurements
+long measureMedian() {
+  long a[MEDIAN_SAMPLES];
+  for (int i = 0; i < MEDIAN_SAMPLES; ++i) {
+    a[i] = measureOnce();
+    delay(20);
+  }
+  // insertion sort small array
+  for (int i = 1; i < MEDIAN_SAMPLES; ++i) {
+    long key = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > key) {
+      a[j + 1] = a[j];
+      j--;
+    }
+    a[j + 1] = key;
+  }
+  return a[MEDIAN_SAMPLES / 2];
+}
+
+// Smoothly move servo to 'toAngle'
+void moveServoSmooth(int toAngle) {
+  toAngle = constrain(toAngle, 0, MAX_SERVO_ANGLE);
+  if (toAngle == currentServoAngle) return;
+  if (toAngle > currentServoAngle) {
+    for (int a = currentServoAngle; a <= toAngle; ++a) {
+      lidServo.write(a);
+      delay(SERVO_STEP_DELAY_MS);
+    }
+  } else {
+    for (int a = currentServoAngle; a >= toAngle; --a) {
+      lidServo.write(a);
+      delay(SERVO_STEP_DELAY_MS);
+    }
+  }
+  currentServoAngle = toAngle;
+}
+
+void openLid() {
+  digitalWrite(LED_PIN, HIGH);
+  Serial.println(">> ACTION: Lid OPEN");
+  moveServoSmooth(SERVO_OPEN_ANGLE);
+  isOpen = true;
+  openUntil = millis() + OPEN_MS;
+  lastOpenTime = millis();
+  // reset counters to avoid re-triggering quickly
+  detectCounter = 0;
+  missCounter = 0;
+}
+
+void closeLid() {
+  digitalWrite(LED_PIN, LOW);
+  Serial.println(">> ACTION: Lid CLOSE");
+  moveServoSmooth(SERVO_CLOSED_ANGLE);
+  isOpen = false;
+  // reset counters
+  detectCounter = 0;
+  missCounter = 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  lidServo.attach(SERVO_PIN);
+  lidServo.write(SERVO_CLOSED_ANGLE);
+  currentServoAngle = SERVO_CLOSED_ANGLE;
+
+  Serial.println("Auto Waste Bin - UNO (Hysteresis+Debug) - ROTATION REVERSED");
+  Serial.println("Serial: 115200");
+}
+
+void loop() {
+  long dist = measureMedian(); // median filtered reading
+  unsigned long now = millis();
+
+  // Print distance periodically and show counters
+  if (now - lastPrint >= DIST_PRINT_INTERVAL) {
+    if (dist == -1) Serial.print("Distance: No echo");
+    else {
+      Serial.print("Distance: ");
+      Serial.print(dist);
+      Serial.print(" cm");
+    }
+    Serial.print("  | detectCnt=");
+    Serial.print(detectCounter);
+    Serial.print(" missCnt=");
+    Serial.println(missCounter);
+    lastPrint = now;
+  }
+
+  // Update counters based on reading
+  if (dist > 0 && dist <= THRESH_CM) {
+    detectCounter++;
+    missCounter = 0;
+  } else {
+    missCounter++;
+    detectCounter = 0;
+  }
+
+  // If enough consecutive detections and not open, open
+  if (!isOpen && detectCounter >= DETECT_REQUIRED && (now - lastOpenTime) > 250) {
+    openLid();
+  }
+
+  // If open, extend open time while object present
+  if (isOpen) {
+    if (dist > 0 && dist <= THRESH_CM) {
+      openUntil = now + OPEN_MS; // extend
+    } else {
+      // require consecutive misses to close (reduces flicker)
+      if (missCounter >= MISS_REQUIRED && now >= openUntil) {
+        closeLid();
+      }
+    }
+  }
+
+  delay(60); // small loop delay
+}

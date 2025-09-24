@@ -1,8 +1,15 @@
-// Auto Waste Bin - UNO (HC-SR04 + Servo + LED) - Hysteresis + Debug
+// Auto Waste Bin - UNO (HC-SR04 + Servo + LED) - Hysteresis + Robust Recovery
 // Pins: TRIG=D12, ECHO=D11, SERVO=D9, LED=D8
 // Serial: 115200
+//
+// Features:
+// - Median of only valid samples (ignores -1 timeouts)
+// - Soft sensor/servo recovery after prolonged no-echo
+// - Smooth servo movement, hysteresis for stable open/close
+// - Optional/WDT block commented (hard reset if MCU locks)
 
 #include <Servo.h>
+// #include <avr/wdt.h> // uncomment if you want to enable AVR watchdog (advanced)
 
 const int TRIG_PIN = 12;
 const int ECHO_PIN = 11;
@@ -19,9 +26,9 @@ const int DETECT_REQUIRED = 3; // consecutive valid detections to open
 const int MISS_REQUIRED   = 3; // consecutive misses to consider "gone" and eventually close
 
 // Servo tuning (change if needed)
-// --- SWAPPED to reverse rotation direction ---
-const int SERVO_CLOSED_ANGLE = 160;   // previously open; now closed (degrees)
-const int SERVO_OPEN_ANGLE   = 0;     // previously closed; now open
+// --- 70° travel: closed = 160, open = 90 (160 - 90 = 70) ---
+const int SERVO_CLOSED_ANGLE = 160;   // Closed position (degrees)
+const int SERVO_OPEN_ANGLE   = 90;    // Open position (degrees) -> 70° travel
 const int MAX_SERVO_ANGLE    = 180;   // hard clamp
 const int SERVO_STEP_DELAY_MS = 6;    // smooth movement step delay (ms)
 
@@ -36,7 +43,13 @@ int currentServoAngle = SERVO_CLOSED_ANGLE;
 int detectCounter = 0;
 int missCounter = 0;
 
-// Single ultrasonic measure (cm). Returns -1 on timeout/no echo.
+// Recovery related
+const unsigned long SENSOR_RECOVER_AFTER_MS = 10000UL; // 10s of no valid echoes triggers recovery
+unsigned long lastValidEchoAt = 0;
+
+/////////////////////////////////////////////////////////////////////////
+// Basic ultrasonic measurement (single shot). Returns -1 on timeout.
+/////////////////////////////////////////////////////////////////////////
 long measureOnce() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -50,15 +63,23 @@ long measureOnce() {
   return cm;
 }
 
-// Return median of MEDIAN_SAMPLES measurements
+/////////////////////////////////////////////////////////////////////////
+// Median of only valid samples; return -1 only if all samples timed out
+/////////////////////////////////////////////////////////////////////////
 long measureMedian() {
   long a[MEDIAN_SAMPLES];
+  int filled = 0;
   for (int i = 0; i < MEDIAN_SAMPLES; ++i) {
-    a[i] = measureOnce();
+    long v = measureOnce();
     delay(20);
+    if (v >= 0) {
+      a[filled++] = v;
+    }
   }
-  // insertion sort small array
-  for (int i = 1; i < MEDIAN_SAMPLES; ++i) {
+  if (filled == 0) return -1; // all timeouts -> signal no echo
+
+  // insertion sort for small array
+  for (int i = 1; i < filled; ++i) {
     long key = a[i];
     int j = i - 1;
     while (j >= 0 && a[j] > key) {
@@ -67,10 +88,12 @@ long measureMedian() {
     }
     a[j + 1] = key;
   }
-  return a[MEDIAN_SAMPLES / 2];
+  return a[filled / 2];
 }
 
+/////////////////////////////////////////////////////////////////////////
 // Smoothly move servo to 'toAngle'
+/////////////////////////////////////////////////////////////////////////
 void moveServoSmooth(int toAngle) {
   toAngle = constrain(toAngle, 0, MAX_SERVO_ANGLE);
   if (toAngle == currentServoAngle) return;
@@ -88,6 +111,9 @@ void moveServoSmooth(int toAngle) {
   currentServoAngle = toAngle;
 }
 
+/////////////////////////////////////////////////////////////////////////
+// Action helpers
+/////////////////////////////////////////////////////////////////////////
 void openLid() {
   digitalWrite(LED_PIN, HIGH);
   Serial.println(">> ACTION: Lid OPEN");
@@ -95,7 +121,6 @@ void openLid() {
   isOpen = true;
   openUntil = millis() + OPEN_MS;
   lastOpenTime = millis();
-  // reset counters to avoid re-triggering quickly
   detectCounter = 0;
   missCounter = 0;
 }
@@ -105,9 +130,47 @@ void closeLid() {
   Serial.println(">> ACTION: Lid CLOSE");
   moveServoSmooth(SERVO_CLOSED_ANGLE);
   isOpen = false;
-  // reset counters
   detectCounter = 0;
   missCounter = 0;
+}
+
+/////////////////////////////////////////////////////////////////////////
+// Soft recovery: toggle TRIG, re-init pins, reattach servo, blink LED.
+// This tries to recover the sensor and servo without full power cycle.
+/////////////////////////////////////////////////////////////////////////
+void attemptSensorRecovery() {
+  Serial.println("!! RECOVER: Attempting sensor/servo recovery");
+
+  // Ensure trig is output and briefly toggle
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  delay(50);
+  for (int i = 0; i < 3; ++i) {
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(15);
+    digitalWrite(TRIG_PIN, LOW);
+    delay(50);
+  }
+
+  // Reinitialize echo pin and servo
+  pinMode(ECHO_PIN, INPUT);
+
+  // Reattach servo (some drivers like a detach/attach)
+  lidServo.detach();
+  delay(50);
+  lidServo.attach(SERVO_PIN);
+  lidServo.write(currentServoAngle);
+
+  // Blink LED to show recovery attempt
+  for (int i = 0; i < 3; ++i) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(80);
+    digitalWrite(LED_PIN, LOW);
+    delay(80);
+  }
+
+  // Give the sensor a moment; update last valid echo time to avoid repeated recovery calls
+  lastValidEchoAt = millis();
 }
 
 void setup() {
@@ -122,15 +185,28 @@ void setup() {
   lidServo.write(SERVO_CLOSED_ANGLE);
   currentServoAngle = SERVO_CLOSED_ANGLE;
 
-  Serial.println("Auto Waste Bin - UNO (Hysteresis+Debug) - ROTATION REVERSED");
+  lastValidEchoAt = millis();
+
+  Serial.println("Auto Waste Bin - UNO (Hysteresis+Robust Recovery) - 70deg travel (160->90)");
   Serial.println("Serial: 115200");
+
+  // OPTIONAL: enable WDT here if you want a hard reset when the MCU locks.
+  // Use with caution! Uncomment both lines below to enable a ~2s watchdog:
+  // wdt_enable(WDTO_2S);
+  // wdt_reset();
 }
 
 void loop() {
-  long dist = measureMedian(); // median filtered reading
+  // If using watchdog, pet it:
+  // wdt_reset(); // uncomment if WDT enabled
+
+  long dist = measureMedian(); // median filtered reading (ignores timeouts)
   unsigned long now = millis();
 
-  // Print distance periodically and show counters
+  // Update last valid echo timestamp if we got a valid reading
+  if (dist >= 0) lastValidEchoAt = now;
+
+  // Periodic status print
   if (now - lastPrint >= DIST_PRINT_INTERVAL) {
     if (dist == -1) Serial.print("Distance: No echo");
     else {
@@ -145,7 +221,12 @@ void loop() {
     lastPrint = now;
   }
 
-  // Update counters based on reading
+  // If we've had no valid echoes for a while, attempt soft recovery
+  if ((now - lastValidEchoAt) > SENSOR_RECOVER_AFTER_MS) {
+    attemptSensorRecovery();
+  }
+
+  // Update detection counters
   if (dist > 0 && dist <= THRESH_CM) {
     detectCounter++;
     missCounter = 0;
@@ -154,17 +235,16 @@ void loop() {
     detectCounter = 0;
   }
 
-  // If enough consecutive detections and not open, open
+  // Open on stable detections
   if (!isOpen && detectCounter >= DETECT_REQUIRED && (now - lastOpenTime) > 250) {
     openLid();
   }
 
-  // If open, extend open time while object present
+  // While open, extend if object present; close on stable misses
   if (isOpen) {
     if (dist > 0 && dist <= THRESH_CM) {
       openUntil = now + OPEN_MS; // extend
     } else {
-      // require consecutive misses to close (reduces flicker)
       if (missCounter >= MISS_REQUIRED && now >= openUntil) {
         closeLid();
       }
